@@ -841,7 +841,8 @@ static Frame *frame_queue_peek_readable(FrameQueue *f)
         SDL_CondWait(f->cond, f->mutex);
     }
     SDL_UnlockMutex(f->mutex);
-    printf("%s peek readable in %s ,unlock \n",thread_name(pthread_self()), queue_name(f));
+    printf("%s peek readable in %s rindex:%d rindex_shown:% ,unlock \n",
+            thread_name(pthread_self()), queue_name(f), f->rindex, f->rindex_shown, f->max_size);
 
     if (f->pktq->abort_request)
         return NULL;
@@ -1613,19 +1614,47 @@ static double compute_target_delay(double delay, VideoState *is)
     if (get_master_sync_type(is) != AV_SYNC_VIDEO_MASTER) {
         /* if video is slave, we try to correct big delays by
            duplicating or deleting a frame */
+        ///  get_clock(&is->vidclk) 获取当前的视频时钟，视频时钟 = 当前正在播放帧的pts + 当前播放帧已经播放了的时间。
+        ///  get_master_clock(is)是获取到当前的音频时钟, 
+        /// 在视频同步到音频方法的时候, get_master_clock(is) 相当于 get_clock(&is->audclk);
+        /// 音频时钟 = 当前正在播放音频帧的播放结束时间 - 还未播放完的音频时长。
+        /// diff等于视频时钟相比音频时钟的差值；
+       /// diff > 0 表示视频快了；
+       /// diff < 0 表示视频慢了
         diff = get_clock(&is->vidclk) - get_master_clock(is);
 
         /* skip or repeat frame. We take into account the
            delay to compute the threshold. I still don't know
            if it is the best guess */
+        /// AV_SYNC_THRESHOLD_MIN = 0.04
+        /// AV_SYNC_THRESHOLD_MAX = 0.1
+        /// sync_threshold = max(0.04, min(0.1, delay))
+        /// 换句话说 sync_threshold 的最小值为 0.04， 最大值为 0.1，在40ms 和 100 ms 之间。
+        ///  如果 delay 的值在 40 ms 和 100ms 之间那么  sync_threshold 就是 delay
+        /// delay 是当前正在播放的视频帧在屏幕上显示的时长
         sync_threshold = FFMAX(AV_SYNC_THRESHOLD_MIN, FFMIN(AV_SYNC_THRESHOLD_MAX, delay));
+        /// isnan 检查diff 是否为数字，不是返回 true，是返回false
         if (!isnan(diff) && fabs(diff) < is->max_frame_duration) {
+            /// 如果视频比音频慢了，并且超过了 sync_threshold
+            /// 那么将对 delay 减小 diff，将 delay 的值到 [0, delay + diff]之间，加快视频的播放速度
             if (diff <= -sync_threshold)
-                delay = FFMAX(0, delay + diff);
+                delay = FFMAX(0, delay + diff); 
+            /// 如果视频快了，时差超过了 sync_threshold，delay 同时也超过了100ms，那么增加 delay 的值 diff，减慢视频的播放速速
             else if (diff >= sync_threshold && delay > AV_SYNC_FRAMEDUP_THRESHOLD)
                 delay = delay + diff;
+            /// 如果视频快了，时长超过 sync_threshold， 但是小于 100ms，也就是说视频快的不太多
+            /// 那么将 delay（也就是 last_duration ）增加一倍，减慢视频的速度
             else if (diff >= sync_threshold)
                 delay = 2 * delay;
+            /// 那么为什么这两处处理是不同的，这里的 delay 是当前视频帧在屏幕上停留的时间，
+            /// 个人理解该值接近于与帧率，如果 25 帧的视频。该值的大小在 40ms 左右，
+            /// 现在 delay > 100ms 说明已经delay 太大了，翻倍会变成 200ms 以上，还不如 加上 diff
+            /// 第二种 增加一倍也不会太多。
+
+            /// 这里和前一个条件处理的不同就在于delay（也就是last_duration）是不是大于AV_SYNC_FRAMEDUP_THRESHOLD，
+            /// 上面不直接将delay翻倍应该是delay太大，大于了0.1秒了，超过了不同步阈值的最大值0.1秒了，还不如diff有多少就加多少。
+            /// 而这个条件里面delay翻倍而直接不增加diff的原因应该是一般帧率大概在20fps左右，last_duration差不多就0.05秒，
+            /// 增加一倍也不会太大，毕竟音视频同步本来就是动态同步。
         }
     }
 
@@ -1682,7 +1711,9 @@ retry:
             Frame *vp, *lastvp;
 
             /* dequeue the picture */
+            /// lastvp是指当前正在播放的视频帧
             lastvp = frame_queue_peek_last(&is->pictq);
+            /// vp是指接下来紧接着要播放的视频帧
             vp = frame_queue_peek(&is->pictq);
 
             if (vp->serial != is->videoq.serial) {
@@ -1698,6 +1729,8 @@ retry:
 
             /* compute nominal last_duration */
             /// 计算 lastvp 和 vp 的 pts 差， vp->pts - lastvp->pts;
+            /// last_duration 是当前正在播放的视频帧的理论应该播放的时间
+            /// 换句话说就是理论上当前播放的视频帧应该在屏幕上显示多久
             last_duration = vp_duration(is, lastvp, vp);
             delay = compute_target_delay(last_duration, is);
             /// 从系统启动这一刻起开始计时到当前时刻经历的秒
